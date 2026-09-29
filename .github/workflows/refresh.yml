@@ -1,0 +1,59 @@
+name: Refresh XDP-USDC depth
+
+on:
+  schedule:
+    - cron: "0 2 * * *"    # daily 02:00 UTC
+  workflow_dispatch:        # manual "Run workflow" button
+
+permissions:
+  contents: write           # to commit the refreshed CSV back to the repo
+
+env:
+  POOL: "0x1ef035205f94c7734827961c438474d089a334a0"
+  QUOTE: token1
+  START: "2026-09-11"
+  INTERVAL: "15"
+  OUT: depth_xdp_usdc_15m.csv
+  DUNE_TABLE: xdp_usdc_depth_15m
+  RPC: https://mainnet.base.org
+
+jobs:
+  refresh:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.22"
+
+      - name: Build depth CSV (retries on RPC flakiness)
+        run: |
+          go build -o pooldepth .
+          for attempt in 1 2 3; do
+            rm -f "$OUT"
+            # progress streams to the job log (every 10th getLogs chunk) so a slow run stays visible
+            ./pooldepth -rpc "$RPC" -pool "$POOL" -quote "$QUOTE" -start "$START" \
+                        -linear-ts -interval "$INTERVAL" -out "$OUT" 2>&1 \
+              | awk '!/getLogs/ || (++n % 10 == 0)'
+            if [ -s "$OUT" ]; then break; fi
+            echo "attempt $attempt failed"
+            [ "$attempt" = 3 ] && exit 1
+            sleep 60
+          done
+          wc -l "$OUT"
+
+      - name: Upload to Dune (replaces the table)
+        env:
+          DUNE_API_KEY: ${{ secrets.DUNE_API_KEY }}
+        run: python3 upload_dune.py "$OUT" "$DUNE_TABLE" "XDP-USDC 15m pool depth (auto-refreshed)"
+
+      - name: Commit refreshed CSV
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add "$OUT"
+          git diff --cached --quiet || git commit -m "data: refresh $OUT ($(date -u +%Y-%m-%dT%H:%MZ))"
+          git pull --rebase --quiet
+          git push
