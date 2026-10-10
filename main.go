@@ -55,10 +55,11 @@ const (
 
 // ---------------------------------------------------------------- minimal JSON-RPC client
 type rpcClient struct {
-	url  string
-	http *http.Client
-	mu   sync.Mutex
-	id   int64
+	url        string
+	http       *http.Client
+	mu         sync.Mutex
+	id         int64
+	filterLogs bool // fetch logs via eth_newFilter/eth_getFilterLogs instead of eth_getLogs
 }
 
 type rpcReq struct {
@@ -219,9 +220,8 @@ func (c *rpcClient) blockTimestamp(n uint64) uint64 {
 	return hexToUint64(b.Timestamp)
 }
 
-// first block with timestamp >= ts
-func (c *rpcClient) blockAtOrAfter(ts uint64) uint64 {
-	lo, hi := uint64(0), c.blockNumber()
+// first block in [lo, hi] with timestamp >= ts
+func (c *rpcClient) blockAtOrAfter(ts, lo, hi uint64) uint64 {
 	for lo < hi {
 		mid := (lo + hi) / 2
 		if c.blockTimestamp(mid) >= ts {
@@ -231,6 +231,20 @@ func (c *rpcClient) blockAtOrAfter(ts uint64) uint64 {
 		}
 	}
 	return lo
+}
+
+// first block with timestamp >= ts. With linear (fixed 2s blocks) the block is computed from the
+// head and checked with two header reads, so no old blocks are touched — pruned providers such as
+// publicnode only serve recent history. Falls back to binary search if the check fails.
+func (c *rpcClient) firstBlockAt(ts, head, headTs uint64, linear bool) uint64 {
+	if linear && ts <= headTs {
+		b := head - (headTs-ts)/2 // ts(b) = headTs - 2*(head-b)
+		if c.blockTimestamp(b) >= ts && (b == 0 || c.blockTimestamp(b-1) < ts) {
+			return b
+		}
+		log.Printf("linear block estimate for ts %d failed, falling back to binary search", ts)
+	}
+	return c.blockAtOrAfter(ts, 0, head)
 }
 
 func (c *rpcClient) ethCall(to, data string) string {
@@ -297,21 +311,64 @@ func isRateLimit(err error) bool {
 	return false
 }
 
+// eth_getLogs, or with -filter-logs the equivalent eth_newFilter → eth_getFilterLogs →
+// eth_uninstallFilter (same result set). mainnet.base.org has refused eth_getLogs with
+// -32011 "request limit reached" since ~2026-10-09 but still serves the filter methods.
+func (c *rpcClient) fetchLogs(filter map[string]interface{}) (json.RawMessage, error) {
+	if !c.filterLogs {
+		return c.call("eth_getLogs", filter)
+	}
+	r, err := c.call("eth_newFilter", filter)
+	if err != nil {
+		return nil, err
+	}
+	var id string
+	if err := json.Unmarshal(r, &id); err != nil {
+		return nil, fmt.Errorf("eth_newFilter: bad id: %s", r)
+	}
+	defer c.call("eth_uninstallFilter", id) // filters also expire on their own; ignore errors
+	return c.call("eth_getFilterLogs", id)
+}
+
+// filter created on one backend node and queried on another behind a load balancer — retry
+func isFilterLost(err error) bool {
+	return strings.Contains(strings.ToLower(err.Error()), "filter not found")
+}
+
+// pruned / non-archive provider — bisecting cannot help
+func isNoHistory(err error) bool {
+	s := strings.ToLower(err.Error())
+	for _, k := range []string{"archive", "pruned", "history unavailable", "personal token"} {
+		if strings.Contains(s, k) {
+			return true
+		}
+	}
+	return false
+}
+
 func (c *rpcClient) getLogsRange(addr string, topic0s []string, from, to uint64) []ethLog {
 	var r json.RawMessage
 	var err error
-	for attempt := 0; attempt < 10; attempt++ {
-		r, err = c.call("eth_getLogs", map[string]interface{}{
+	for attempt := 0; attempt < 5; attempt++ {
+		r, err = c.fetchLogs(map[string]interface{}{
 			"address":   addr,
 			"topics":    []interface{}{topic0s},
 			"fromBlock": fmt.Sprintf("0x%x", from),
 			"toBlock":   fmt.Sprintf("0x%x", to),
 		})
-		if err == nil || !isRateLimit(err) {
+		if err == nil || !(isRateLimit(err) || isFilterLost(err)) {
 			break
 		}
 		log.Printf("getLogs %d..%d throttled, retry %d: %v", from, to, attempt+1, err)
-		time.Sleep(time.Duration(1000*(1<<uint(attempt))) * time.Millisecond)
+		time.Sleep(time.Duration(2000*(1<<uint(attempt))) * time.Millisecond)
+	}
+	if err != nil && isNoHistory(err) {
+		log.Fatalf("getLogs %d..%d: provider does not serve this block range (needs an archive node): %v", from, to, err)
+	}
+	if err != nil && isRateLimit(err) {
+		// still throttled after several minutes: the provider is refusing us, fail fast rather
+		// than bisecting into thousands of calls (this is what hung CI for 2h on mainnet.base.org)
+		log.Fatalf("getLogs %d..%d: provider keeps rate-limiting, giving up: %v", from, to, err)
 	}
 	if err != nil {
 		if from == to {
@@ -421,7 +478,7 @@ func main() {
 	rpcURL := flag.String("rpc", "https://mainnet.base.org", "Base JSON-RPC endpoint")
 	pool := flag.String("pool", "0x0aed2bd5abdffcde57c0bcf30e75cd594b8876a9", "CLPool address")
 	quoteSlot := flag.String("quote", "token1", "slot holding the USD token: token0 | token1")
-	startStr := flag.String("start", "2026-05-01", "start date (UTC), inclusive")
+	startStr := flag.String("start", "2026-05-01", "start date YYYY-MM-DD or time YYYY-MM-DDTHH:MM (UTC), inclusive")
 	endBlockFlag := flag.Uint64("end-block", 0, "end block (0 = latest)")
 	step := flag.Uint64("step", 2000, "eth_getLogs block range per request (public Base RPC caps at 2000)")
 	workers := flag.Int("workers", 4, "concurrent getLogs / header fetchers (public Base RPC: keep ≤4)")
@@ -429,6 +486,8 @@ func main() {
 	linearTS := flag.Bool("linear-ts", false, "derive timestamps as ts(first)+2s*(n-first) (Base/OP-stack fixed 2s blocks); verified against the last block")
 	interval := flag.Int("interval", 60, "bucket size in minutes (60 = hourly like the Dune query)")
 	outPath := flag.String("out", "depth.csv", "output CSV path")
+	filterLogs := flag.Bool("filter-logs", false, "fetch logs via eth_newFilter/eth_getFilterLogs (works on mainnet.base.org, which refuses eth_getLogs)")
+	stateDir := flag.String("state", "", "incremental mode: keep mint/burn history + checkpoint in this dir and only fetch blocks since the last run")
 	flag.Parse()
 
 	if *interval <= 0 || 1440%*interval != 0 {
@@ -438,9 +497,12 @@ func main() {
 	quoteIsToken0 := strings.ToLower(*quoteSlot) == "token0"
 	startT, err := time.Parse("2006-01-02", *startStr)
 	if err != nil {
-		log.Fatal(err)
+		if startT, err = time.Parse("2006-01-02T15:04", *startStr); err != nil {
+			log.Fatalf("-start must be YYYY-MM-DD or YYYY-MM-DDTHH:MM (UTC): %v", err)
+		}
 	}
 	rpc := newRPC(*rpcURL)
+	rpc.filterLogs = *filterLogs
 	poolAddr := strings.ToLower(*pool)
 
 	// --- token metadata (token0/token1/decimals) — replaces clpool_call_initialize + tokens.erc20
@@ -454,11 +516,39 @@ func main() {
 	}
 	log.Printf("token0=%s (%.0f dec) token1=%s (%.0f dec) quote=%s", token0, dec0, token1, dec1, *quoteSlot)
 
+	// --- incremental state
+	var st *runState
+	var storedLiq []liqRec
+	snap := map[int64]float64{} // liqNet folded up to the checkpoint (incremental only)
+	if *stateDir != "" {
+		st, snap, storedLiq = loadState(*stateDir)
+		if st == nil {
+			snap = map[int64]float64{}
+		}
+		if st != nil && (st.Pool != poolAddr || st.Quote != *quoteSlot || st.Start != *startStr || st.Interval != *interval) {
+			log.Fatalf("%s was made for pool=%s quote=%s start=%s interval=%d; flags differ — delete it for a full rescan",
+				*stateDir, st.Pool, st.Quote, st.Start, st.Interval)
+		}
+	}
+
 	// --- block range
-	fromBlock := rpc.blockAtOrAfter(uint64(startT.Unix()))
 	toBlock := *endBlockFlag
 	if toBlock == 0 {
 		toBlock = rpc.blockNumber()
+	}
+	toTs := rpc.blockTimestamp(toBlock)
+	var fromBlock uint64
+	var keep [][]string // finished rows reused from the previous output (incremental only)
+	if st != nil {
+		if toBlock < st.ScannedTo {
+			log.Fatalf("end block %d is before the last scanned block %d", toBlock, st.ScannedTo)
+		}
+		fromBlock = st.NextBlock
+		keep = keptRows(*outPath, st.NextBucket)
+		log.Printf("incremental: %d ticks + %d pending mint/burn events and %d finished rows kept, resuming at bucket %s",
+			len(snap), len(storedLiq), len(keep), time.Unix(st.NextBucket, 0).UTC().Format("2006-01-02 15:04"))
+	} else {
+		fromBlock = rpc.firstBlockAt(uint64(startT.Unix()), toBlock, toTs, *linearTS)
 	}
 	log.Printf("blocks %d..%d", fromBlock, toBlock)
 
@@ -565,33 +655,48 @@ func main() {
 	log.Printf("%d swap buckets of %d min", len(hours), *interval)
 
 	// --- liquidity delta events  (liq_delta_events)
-	var events []liqEvent
+	var fresh []liqRec
 	for _, l := range mintLogs {
 		// topics: sig, owner, tickLower, tickUpper ; data: sender, amount, amount0, amount1
-		lo, hi := wordToInt24(l.Topics[2]), wordToInt24(l.Topics[3])
-		amt := bigToFloat(hexToBig(word(l.Data, 1)))
-		ts := tsOf[hexToUint64(l.BlockNumber)]
-		events = append(events, liqEvent{ts, lo, amt}, liqEvent{ts, hi, -amt})
+		b := hexToUint64(l.BlockNumber)
+		fresh = append(fresh, liqRec{block: b, logIdx: hexToUint64(l.LogIndex), ts: tsOf[b],
+			tickLower: wordToInt24(l.Topics[2]), tickUpper: wordToInt24(l.Topics[3]), amount: hexToBig(word(l.Data, 1))})
 	}
 	for _, l := range burnLogs {
 		// topics: sig, owner, tickLower, tickUpper ; data: amount, amount0, amount1
-		lo, hi := wordToInt24(l.Topics[2]), wordToInt24(l.Topics[3])
-		amt := bigToFloat(hexToBig(word(l.Data, 0)))
-		ts := tsOf[hexToUint64(l.BlockNumber)]
-		events = append(events, liqEvent{ts, lo, -amt}, liqEvent{ts, hi, amt})
+		b := hexToUint64(l.BlockNumber)
+		fresh = append(fresh, liqRec{block: b, logIdx: hexToUint64(l.LogIndex), ts: tsOf[b], burn: true,
+			tickLower: wordToInt24(l.Topics[2]), tickUpper: wordToInt24(l.Topics[3]), amount: hexToBig(word(l.Data, 0))})
+	}
+	allLiq := mergeLiq(storedLiq, fresh)
+	// same order as a full scan: all mints (block, logIndex order), then all burns, stable-sorted by ts
+	var events []liqEvent
+	for _, burns := range []bool{false, true} {
+		for _, r := range allLiq {
+			if r.burn != burns {
+				continue
+			}
+			amt := bigToFloat(r.amount)
+			if burns {
+				events = append(events, liqEvent{r.ts, r.tickLower, -amt}, liqEvent{r.ts, r.tickUpper, amt})
+			} else {
+				events = append(events, liqEvent{r.ts, r.tickLower, amt}, liqEvent{r.ts, r.tickUpper, -amt})
+			}
+		}
 	}
 	sort.SliceStable(events, func(i, j int) bool { return events[i].ts < events[j].ts })
 
 	// --- assign each event to the first swap-hour with closeTs >= event ts, then running sum per tick
 	// liqNet[tick] is carried forward across hours; snapshot per hour after applying that hour's events.
-	liqNet := map[int64]float64{}
+	liqNet := make(map[int64]float64, len(snap))
+	for t, v := range snap {
+		liqNet[t] = v
+	}
 	ei := 0
-	out := csv.NewWriter(mustCreate(*outPath))
-	defer out.Flush()
-	out.Write([]string{"hour", "open", "high", "low", "close", "impact_p90", "tier",
-		"base_250", "base_500", "base_1500", "quote_250", "quote_500", "quote_1500"})
+	rows := [][]string{{"hour", "open", "high", "low", "close", "impact_p90", "tier",
+		"base_250", "base_500", "base_1500", "quote_250", "quote_500", "quote_1500"}}
+	rows = append(rows, keep...)
 
-	rows := 0
 	for _, h := range hours {
 		for ei < len(events) && events[ei].ts <= h.closeTs {
 			liqNet[events[ei].tick] += events[ei].net
@@ -656,15 +761,47 @@ func main() {
 			tier = "Moderate"
 		}
 
-		out.Write([]string{
+		rows = append(rows, []string{
 			time.Unix(h.hour, 0).UTC().Format("2006-01-02 15:04:05"),
 			f(h.open), f(h.high), f(h.low), f(h.close), f(p90), tier,
 			f(base[0]), f(base[1]), f(base[2]),
 			f(quote[0]), f(quote[1]), f(quote[2]),
 		})
-		rows++
 	}
-	log.Printf("wrote %d rows to %s", rows, *outPath)
+	writeAtomic(*outPath, func(fh *os.File) {
+		w := csv.NewWriter(fh)
+		w.WriteAll(rows)
+		if err := w.Error(); err != nil {
+			log.Fatal(err)
+		}
+	})
+	log.Printf("wrote %d rows to %s (%d new or updated)", len(rows)-1, *outPath, len(rows)-1-len(keep))
+
+	// --- checkpoint: the bucket holding toBlock may still be open, so the next run recomputes
+	// it from its first block; everything before it is final
+	if *stateDir != "" {
+		nextBucket := int64(toTs) / bucket * bucket
+		nextBlock := rpc.firstBlockAt(uint64(nextBucket), toBlock, toTs, *linearTS)
+		// fold every event before nextBucket into the snapshot, in the same order as the loop above
+		for _, e := range events {
+			if int64(e.ts) >= nextBucket {
+				break
+			}
+			snap[e.tick] += e.net
+		}
+		var pending []liqRec
+		for _, r := range allLiq {
+			if int64(r.ts) >= nextBucket {
+				pending = append(pending, r)
+			}
+		}
+		saveState(*stateDir, &runState{
+			Pool: poolAddr, Quote: *quoteSlot, Start: *startStr, Interval: *interval,
+			NextBlock: nextBlock, NextBucket: nextBucket, ScannedTo: toBlock,
+		}, snap, pending)
+		log.Printf("state saved to %s: %d ticks, %d pending mint/burn events, next run resumes at block %d",
+			*stateDir, len(snap), len(pending), nextBlock)
+	}
 }
 
 // exact p-th percentile (linear interpolation). Dune's approx_percentile will differ slightly.
@@ -684,11 +821,3 @@ func percentile(v []float64, p float64) float64 {
 }
 
 func f(x float64) string { return strconv.FormatFloat(x, 'g', -1, 64) }
-
-func mustCreate(p string) *os.File {
-	fh, err := os.Create(p)
-	if err != nil {
-		log.Fatal(err)
-	}
-	return fh
-}
