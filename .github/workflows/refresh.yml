@@ -1,4 +1,4 @@
-name: Refresh XDP-USDC depth
+name: Refresh XDP-USDC depth (v2)
 
 on:
   schedule:
@@ -11,14 +11,14 @@ permissions:
   contents: write           # to commit the refreshed CSV + state back to the repo
 
 env:
-  POOL: "0x1ef035205f94c7734827961c438474d089a334a0"
+  POOL: "0xc3cbfbaab532a04e36b6f901d725eaa5113fd781"   # v2: Aerodrome migration 2026-10-21 (old pool 0x1ef035205f94c7734827961c438474d089a334a0, frozen data in depth_xdp_usdc_15m.csv)
   QUOTE: token1
-  START: "2026-09-11"
+  START: "2026-10-21"      # new pool deployed 2026-10-21 05:2x UTC
   INTERVAL: "15"
-  OUT: depth_xdp_usdc_15m.csv
-  DUNE_TABLE: xdp_usdc_depth_15m
+  OUT: depth_xdp_usdc_15m_v2.csv
+  DUNE_TABLE: xdp_usdc_depth_15m_v2
   RPC: https://mainnet.base.org
-  STATE: state             # incremental checkpoint (mint/burn snapshot); delete the folder to force a full rescan
+  STATE: state_v2             # incremental checkpoint (mint/burn snapshot); delete the folder to force a full rescan
 
 jobs:
   refresh:
@@ -56,7 +56,7 @@ jobs:
       - name: Upload to Dune (replaces the table)
         env:
           DUNE_API_KEY: ${{ secrets.DUNE_API_KEY }}
-        run: python3 upload_dune.py "$OUT" "$DUNE_TABLE" "XDP-USDC 15m pool depth (auto-refreshed)"
+        run: python3 upload_dune.py "$OUT" "$DUNE_TABLE" "XDP-USDC v2 (post-migration pool 0xc3cbfbaab532a04e36b6f901d725eaa5113fd781) 15m pool depth (auto-refreshed)"
 
       - name: Commit refreshed CSV + state
         run: |
