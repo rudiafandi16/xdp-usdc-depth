@@ -820,4 +820,6 @@ func percentile(v []float64, p float64) float64 {
 	return s[lo] + (s[hi]-s[lo])*(pos-float64(lo))
 }
 
-func f(x float64) string { return strconv.FormatFloat(x, 'g', -1, 64) }
+// plain decimal, shortest exact round-trip. Not 'g': that switches to e-notation at >= 1e6 and
+// < 1e-4, and Dune's CSV upload then types the whole column as varchar.
+func f(x float64) string { return strconv.FormatFloat(x, 'f', -1, 64) }

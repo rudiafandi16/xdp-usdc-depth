@@ -136,3 +136,11 @@ float digit because Go fuses multiply-adds on arm64). Delete the state folder to
 
 Persistent 429s now fail fast (`log.Fatal`) instead of bisecting; archive/pruned errors too.
 `-start` also accepts `YYYY-MM-DDTHH:MM`.
+
+## Dune column types (2026-10-29)
+
+Dune's CSV upload infers each column's type from its values and re-renders `hour` as text
+`YYYY-MM-DDTHH:MM` (query it with `date_parse(hour, '%Y-%m-%dT%H:%i')`). Numbers used to be written
+with `strconv` 'g', which switches to e-notation at >= 1e6 / < 1e-4; Dune then typed those columns
+(e.g. xdp `quote_*`) as varchar. `f()` now writes plain decimals ('f', exact round-trip), and
+incremental runs re-format kept rows the same way, so the next upload fixes the column types.

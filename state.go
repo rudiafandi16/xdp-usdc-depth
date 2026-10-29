@@ -142,6 +142,18 @@ func keptRows(path string, before int64) [][]string {
 			log.Fatalf("%s: bad hour %q", path, r[0])
 		}
 		if t.Unix() < before {
+			// rows written by older versions may use e-notation; re-format the numbers (exact
+			// round-trip, same values) so the whole CSV stays plain decimal
+			for i, v := range r {
+				if i == 0 || i == 6 { // hour, tier
+					continue
+				}
+				x, err := strconv.ParseFloat(v, 64)
+				if err != nil {
+					log.Fatalf("%s: bad number %q", path, v)
+				}
+				r[i] = f(x)
+			}
 			out = append(out, r)
 		}
 	}

@@ -17,7 +17,7 @@ uploads the CSV to Dune every day via GitHub Actions.
 4. Query it on Dune:
 
 ```sql
-SELECT date_parse(hour, '%Y-%m-%d %H:%i:%s') AS ts, *
+SELECT date_parse(hour, '%Y-%m-%dT%H:%i')   -- Dune stores hour as text '2026-10-29T14:45' AS ts, *
 FROM dune.forcemulti.dataset_xdp_usdc_depth_15m_v2   -- v1 (old pool): dataset_xdp_usdc_depth_15m
 ORDER BY 1
 ```
