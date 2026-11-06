@@ -233,16 +233,44 @@ func (c *rpcClient) blockAtOrAfter(ts, lo, hi uint64) uint64 {
 	return lo
 }
 
-// first block with timestamp >= ts. With linear (fixed 2s blocks) the block is computed from the
-// head and checked with two header reads, so no old blocks are touched — pruned providers such as
-// publicnode only serve recent history. Falls back to binary search if the check fails.
+// Base block-time schedule. Base had fixed 2s blocks until the Denim hard fork
+// (2026-11-05 18:00:01 UTC), then fixed 200ms blocks. Headers gained timestampMs; the
+// second-resolution timestamp is floor(timestampMs / 1000), so five blocks share each second.
+// Verified against sampled headers on 2026-11-06.
+const (
+	denimAnchor   = 53556127   // last 2s block; denimAnchor+1 is the first 200ms block
+	denimAnchorTs = 1793901601 // timestamp of denimAnchor (and of the next four blocks)
+)
+
+// baseTsMs is the exact timestamp in ms of Base block n under the schedule above
+func baseTsMs(n uint64) uint64 {
+	if n >= denimAnchor {
+		return denimAnchorTs*1000 + 200*(n-denimAnchor)
+	}
+	return denimAnchorTs*1000 - 2000*(denimAnchor-n)
+}
+
+// baseTs is the header's second-resolution timestamp of Base block n
+func baseTs(n uint64) uint64 { return baseTsMs(n) / 1000 }
+
+// first Base block whose (second-resolution) timestamp is >= ts, under the schedule
+func baseFirstBlockAt(ts uint64) uint64 {
+	if ts <= denimAnchorTs {
+		return denimAnchor - (denimAnchorTs-ts)/2
+	}
+	return denimAnchor + 5*(ts-denimAnchorTs)
+}
+
+// first block with timestamp >= ts. With linear (Base schedule) the block is computed and checked
+// with two header reads, so no old blocks are touched — pruned providers such as publicnode only
+// serve recent history. Falls back to binary search if the check fails.
 func (c *rpcClient) firstBlockAt(ts, head, headTs uint64, linear bool) uint64 {
 	if linear && ts <= headTs {
-		b := head - (headTs-ts)/2 // ts(b) = headTs - 2*(head-b)
-		if c.blockTimestamp(b) >= ts && (b == 0 || c.blockTimestamp(b-1) < ts) {
+		b := baseFirstBlockAt(ts)
+		if b <= head && c.blockTimestamp(b) >= ts && (b == 0 || c.blockTimestamp(b-1) < ts) {
 			return b
 		}
-		log.Printf("linear block estimate for ts %d failed, falling back to binary search", ts)
+		log.Printf("schedule block estimate for ts %d failed, falling back to binary search", ts)
 	}
 	return c.blockAtOrAfter(ts, 0, head)
 }
@@ -483,7 +511,7 @@ func main() {
 	step := flag.Uint64("step", 2000, "eth_getLogs block range per request (public Base RPC caps at 2000)")
 	workers := flag.Int("workers", 4, "concurrent getLogs / header fetchers (public Base RPC: keep ≤4)")
 	batchSize := flag.Int("batch", 100, "eth_getBlockByNumber calls per JSON-RPC batch (public Base RPC allows 10)")
-	linearTS := flag.Bool("linear-ts", false, "derive timestamps as ts(first)+2s*(n-first) (Base/OP-stack fixed 2s blocks); verified against the last block")
+	linearTS := flag.Bool("linear-ts", false, "derive timestamps from Base's block schedule (2s blocks, 200ms since the Denim fork) instead of fetching headers; verified against real headers")
 	interval := flag.Int("interval", 60, "bucket size in minutes (60 = hourly like the Dune query)")
 	outPath := flag.String("out", "depth.csv", "output CSV path")
 	filterLogs := flag.Bool("filter-logs", false, "fetch logs via eth_newFilter/eth_getFilterLogs (works on mainnet.base.org, which refuses eth_getLogs)")
@@ -585,16 +613,20 @@ func main() {
 	log.Printf("fetching %d block timestamps", len(blocks))
 	var tsOf map[uint64]uint64
 	if *linearTS && len(blocks) > 0 {
+		// verify the schedule at both ends (and the middle) before trusting it for every block
 		first, last := blocks[0], blocks[len(blocks)-1]
-		t0, t1 := rpc.blockTimestamp(first), rpc.blockTimestamp(last)
-		if t1-t0 != 2*(last-first) {
-			log.Fatalf("-linear-ts: blocks %d..%d span %ds, expected %ds — chain is not 2s/block, drop the flag", first, last, t1-t0, 2*(last-first))
+		for _, b := range []uint64{first, blocks[len(blocks)/2], last} {
+			if got := rpc.blockTimestamp(b); got != baseTs(b) {
+				log.Fatalf("-linear-ts: block %d has timestamp %d, Base schedule says %d — block time changed again "+
+					"(new hard fork?); update denimAnchor/baseTsMs or drop the flag", b, got, baseTs(b))
+			}
 		}
 		tsOf = make(map[uint64]uint64, len(blocks))
 		for _, b := range blocks {
-			tsOf[b] = t0 + 2*(b-first)
+			tsOf[b] = baseTs(b)
 		}
-		log.Printf("timestamps derived linearly from block %d (ts %d), verified at block %d", first, t0, last)
+		log.Printf("timestamps derived from the Base block schedule (2s, 200ms since Denim block %d), verified at blocks %d..%d",
+			denimAnchor+1, first, last)
 	} else {
 		tsOf = rpc.blockTimestamps(blocks, *workers, *batchSize)
 	}

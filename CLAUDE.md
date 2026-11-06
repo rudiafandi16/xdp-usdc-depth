@@ -144,3 +144,14 @@ Dune's CSV upload infers each column's type from its values and re-renders `hour
 with `strconv` 'g', which switches to e-notation at >= 1e6 / < 1e-4; Dune then typed those columns
 (e.g. xdp `quote_*`) as varchar. `f()` now writes plain decimals ('f', exact round-trip), and
 incremental runs re-format kept rows the same way, so the next upload fixes the column types.
+
+## Base Denim hard fork — 200ms blocks (2026-11-05)
+
+At 2026-11-05 18:00:01 UTC Base's Denim fork replaced 2s blocks with 200ms blocks (first fast block
+53556128). Headers gained `timestampMs`; `timestamp` = floor(timestampMs/1000), so five blocks share
+each second. The old `-linear-ts` check (2s/block) correctly refused to run (rsgp CI failed 2026-11-06).
+`-linear-ts` now uses the exact schedule in `baseTsMs` (anchor `denimAnchor` = 53556127, ts 1793901601):
+2s per block before, 200ms after. Verified 2026-11-06: 19 sampled post-fork headers match; a window
+across the fork is byte-identical to fetching real headers; rsgp incremental == full scan. If Base
+changes block time again the check at three blocks fails fast with a clear message — add a new anchor.
+Note: 15-min buckets are now 4,500 blocks and getLogs needs ~10x more 2,000-block chunks per day.
